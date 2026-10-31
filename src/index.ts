@@ -38,6 +38,8 @@ export interface MinimatchOptions {
   optimizationLevel?: number
   platform?: Platform
   windowsNoMagicRoot?: boolean
+  maxGlobstarRecursion?: number
+  maxExtglobRecursion?: number
 }
 
 export const minimatch = (
@@ -309,6 +311,7 @@ export class Minimatch {
   isWindows: boolean
   platform: Platform
   windowsNoMagicRoot: boolean
+  maxGlobstarRecursion: number
 
   regexp: false | null | MMRegExp
   constructor(pattern: string, options: MinimatchOptions = {}) {
@@ -316,6 +319,7 @@ export class Minimatch {
 
     options = options || {}
     this.options = options
+    this.maxGlobstarRecursion = options.maxGlobstarRecursion ?? 200
     this.pattern = pattern
     this.platform = options.platform || defaultPlatform
     this.isWindows = this.platform === 'win32'
@@ -757,14 +761,20 @@ export class Minimatch {
   // Partial means, if you run out of file before you run
   // out of pattern, then that's fine, as long as all
   // the parts match.
-  matchOne(file: string[], pattern: ParseReturn[], partial: boolean = false) {
-    const options = this.options
+  matchOne(
+    file: string[],
+    pattern: ParseReturn[],
+    partial: boolean = false
+  ) {
+    let fileStartIndex = 0
+    let patternStartIndex = 0
 
     // UNC paths like //?/X:/... can match X:/... and vice versa
     // Drive letters in absolute drive or unc paths are always compared
     // case-insensitively.
     if (this.isWindows) {
-      const fileDrive = typeof file[0] === 'string' && /^[a-z]:$/i.test(file[0])
+      const fileDrive =
+        typeof file[0] === 'string' && /^[a-z]:$/i.test(file[0])
       const fileUNC =
         !fileDrive &&
         file[0] === '' &&
@@ -785,14 +795,14 @@ export class Minimatch {
       const fdi = fileUNC ? 3 : fileDrive ? 0 : undefined
       const pdi = patternUNC ? 3 : patternDrive ? 0 : undefined
       if (typeof fdi === 'number' && typeof pdi === 'number') {
-        const [fd, pd]: [string, string] = [file[fdi], pattern[pdi] as string]
+        const [fd, pd]: [string, string] = [
+          file[fdi],
+          pattern[pdi] as string,
+        ]
         if (fd.toLowerCase() === pd.toLowerCase()) {
           pattern[pdi] = fd
-          if (pdi > fdi) {
-            pattern = pattern.slice(pdi)
-          } else if (fdi > pdi) {
-            file = file.slice(fdi)
-          }
+          patternStartIndex = pdi
+          fileStartIndex = fdi
         }
       }
     }
@@ -804,120 +814,207 @@ export class Minimatch {
       file = this.levelTwoFileOptimize(file)
     }
 
-    this.debug('matchOne', this, { file, pattern })
-    this.debug('matchOne', file.length, pattern.length)
+    if (pattern.includes(GLOBSTAR)) {
+      return this.#matchGlobstar(
+        file, pattern, partial, fileStartIndex, patternStartIndex
+      )
+    }
 
+    return this.#matchOne(
+      file, pattern, partial, fileStartIndex, patternStartIndex
+    )
+  }
+
+  #matchGlobstar(
+    file: string[],
+    pattern: ParseReturn[],
+    partial: boolean,
+    fileIndex: number,
+    patternIndex: number
+  ) {
+    const firstgs = pattern.indexOf(GLOBSTAR, patternIndex)
+    const lastgs = pattern.lastIndexOf(GLOBSTAR)
+
+    const [head, body, tail] = partial ? [
+      pattern.slice(patternIndex, firstgs),
+      pattern.slice(firstgs + 1),
+      [],
+    ] : [
+      pattern.slice(patternIndex, firstgs),
+      pattern.slice(firstgs + 1, lastgs),
+      pattern.slice(lastgs + 1),
+    ]
+
+    if (head.length) {
+      const fileHead = file.slice(fileIndex, fileIndex + head.length)
+      if (!this.#matchOne(fileHead, head, partial, 0, 0)) return false
+      fileIndex += head.length
+    }
+
+    let fileTailMatch: number = 0
+    if (tail.length) {
+      if (tail.length + fileIndex > file.length) return false
+      let tailStart = file.length - tail.length
+      if (this.#matchOne(file, tail, partial, tailStart, 0)) {
+        fileTailMatch = tail.length
+      } else {
+        if (
+          file[file.length - 1] !== '' ||
+          fileIndex + tail.length === file.length
+        ) {
+          return false
+        }
+        tailStart--
+        if (!this.#matchOne(file, tail, partial, tailStart, 0)) return false
+        fileTailMatch = tail.length + 1
+      }
+    }
+
+    if (!body.length) {
+      let sawSome = !!fileTailMatch
+      for (let i = fileIndex; i < file.length - fileTailMatch; i++) {
+        const f = String(file[i])
+        sawSome = true
+        if (
+          f === '.' || f === '..' ||
+          (!this.options.dot && f.startsWith('.'))
+        ) {
+          return false
+        }
+      }
+      return partial || sawSome
+    }
+
+    const bodySegments: [ParseReturn[], number][] = [[[], 0]]
+    let currentBody: [ParseReturn[], number] = bodySegments[0]
+    let nonGsParts = 0
+    const nonGsPartsSums: number[] = [0]
+    for (const b of body) {
+      if (b === GLOBSTAR) {
+        nonGsPartsSums.push(nonGsParts)
+        currentBody = [[], 0]
+        bodySegments.push(currentBody)
+      } else {
+        currentBody[0].push(b)
+        nonGsParts++
+      }
+    }
+    // the portions in this section and the ones after it
+    bodySegments.forEach((b, i) => {
+      b[1] = nonGsParts - (nonGsPartsSums[i] as number)
+    })
+
+    return !!this.#matchGlobStarBodySections(
+      file, bodySegments, file.length - fileTailMatch, fileIndex, 0,
+      partial, 0, !!fileTailMatch, new Set()
+    )
+  }
+
+  #matchGlobStarBodySections(
+    file: string[],
+    // pattern section, and the portions that it and the rest need
+    bodySegments: [ParseReturn[], number][],
+    // the end of the file portions that the body can match
+    fileLength: number,
+    fileIndex: number,
+    bodyIndex: number,
+    partial: boolean,
+    globStarDepth: number,
+    sawTail: boolean,
+    // the places that a walk has already tried, as
+    // bodyIndex * (file.length + 1) + fileIndex. A walk from a place
+    // does the same no matter how it got there, and it only comes back
+    // if it found no match, so a walk that gets to one stops.
+    tried: Set<number>
+  ): boolean | null {
+    const bs = bodySegments[bodyIndex]
+    if (!bs) {
+      // with partial, the body is the rest of the pattern, so it
+      // matches if no portions are left, or only the '' of a trailing
+      // / (as a/* matches a/b/). A ** at the end walks them as its own
+      // empty section.
+      if (partial) {
+        return (
+          fileIndex >= fileLength ||
+          (fileIndex === fileLength - 1 && file[fileIndex] === '')
+        )
+      }
+      // just make sure that there's no bad dots before the tail
+      for (let i = fileIndex; i < fileLength; i++) {
+        sawTail = true
+        const f = file[i]
+        if (
+          f === '.' || f === '..' ||
+          (!this.options.dot && f.startsWith('.'))
+        ) {
+          return false
+        }
+      }
+      return sawTail
+    }
+
+    // have a non-globstar body section to test, up to the last index
+    // where it can start
+    const [body, need] = bs
+    // with partial, the path can end before the body does
+    const after = partial ? fileLength : fileLength - need
+    while (fileIndex <= after) {
+      const key = bodyIndex * (file.length + 1) + fileIndex
+      if (tried.has(key)) return false
+      tried.add(key)
+      const m = this.#matchOne(
+        file, body, partial, fileIndex, 0, fileIndex + body.length
+      )
+      if (m && globStarDepth < this.maxGlobstarRecursion) {
+        const sub = this.#matchGlobStarBodySections(
+          file, bodySegments, fileLength, fileIndex + body.length,
+          bodyIndex + 1, partial, globStarDepth + 1, sawTail, tried
+        )
+        if (sub !== false) return sub
+      }
+      // the ** does not walk past the last place the body can start
+      if (fileIndex === after) break
+      const f = file[fileIndex]
+      if (
+        f === '.' || f === '..' ||
+        (!this.options.dot && f.startsWith('.'))
+      ) {
+        return false
+      }
+      fileIndex++
+    }
+    return partial || null
+  }
+
+  #matchOne(
+    file: string[],
+    pattern: ParseReturn[],
+    partial: boolean,
+    fileIndex: number,
+    patternIndex: number,
+    // only match the file portions before this index
+    fileEnd: number = file.length
+  ) {
+    let fi: number
+    let pi: number
+    let pl: number
+    let fl: number
     for (
-      var fi = 0, pi = 0, fl = file.length, pl = pattern.length;
+      fi = fileIndex, pi = patternIndex,
+        fl = Math.min(fileEnd, file.length), pl = pattern.length;
       fi < fl && pi < pl;
       fi++, pi++
     ) {
       this.debug('matchOne loop')
-      var p = pattern[pi]
-      var f = file[fi]
+      let p = pattern[pi]
+      let f = file[fi]
 
       this.debug(pattern, p, f)
 
-      // should be impossible.
-      // some invalid regexp stuff in the set.
       /* c8 ignore start */
-      if (p === false) {
-        return false
-      }
+      if (p === false || p === GLOBSTAR) return false
       /* c8 ignore stop */
 
-      if (p === GLOBSTAR) {
-        this.debug('GLOBSTAR', [pattern, p, f])
-
-        // "**"
-        // a/**/b/**/c would match the following:
-        // a/b/x/y/z/c
-        // a/x/y/z/b/c
-        // a/b/x/b/x/c
-        // a/b/c
-        // To do this, take the rest of the pattern after
-        // the **, and see if it would match the file remainder.
-        // If so, return success.
-        // If not, the ** "swallows" a segment, and try again.
-        // This is recursively awful.
-        //
-        // a/**/b/**/c matching a/b/x/y/z/c
-        // - a matches a
-        // - doublestar
-        //   - matchOne(b/x/y/z/c, b/**/c)
-        //     - b matches b
-        //     - doublestar
-        //       - matchOne(x/y/z/c, c) -> no
-        //       - matchOne(y/z/c, c) -> no
-        //       - matchOne(z/c, c) -> no
-        //       - matchOne(c, c) yes, hit
-        var fr = fi
-        var pr = pi + 1
-        if (pr === pl) {
-          this.debug('** at the end')
-          // a ** at the end will just swallow the rest.
-          // We have found a match.
-          // however, it will not swallow /.x, unless
-          // options.dot is set.
-          // . and .. are *never* matched by **, for explosively
-          // exponential reasons.
-          for (; fi < fl; fi++) {
-            if (
-              file[fi] === '.' ||
-              file[fi] === '..' ||
-              (!options.dot && file[fi].charAt(0) === '.')
-            )
-              return false
-          }
-          return true
-        }
-
-        // ok, let's see if we can swallow whatever we can.
-        while (fr < fl) {
-          var swallowee = file[fr]
-
-          this.debug('\nglobstar while', file, fr, pattern, pr, swallowee)
-
-          // XXX remove this slice.  Just pass the start index.
-          if (this.matchOne(file.slice(fr), pattern.slice(pr), partial)) {
-            this.debug('globstar found match!', fr, fl, swallowee)
-            // found a match.
-            return true
-          } else {
-            // can't swallow "." or ".." ever.
-            // can only swallow ".foo" when explicitly asked.
-            if (
-              swallowee === '.' ||
-              swallowee === '..' ||
-              (!options.dot && swallowee.charAt(0) === '.')
-            ) {
-              this.debug('dot detected!', file, fr, pattern, pr)
-              break
-            }
-
-            // ** swallows a segment, and continue.
-            this.debug('globstar swallow a segment, and continue')
-            fr++
-          }
-        }
-
-        // no match was found.
-        // However, in partial mode, we can't say this is necessarily over.
-        /* c8 ignore start */
-        if (partial) {
-          // ran out of file
-          this.debug('\n>>> no match, partial?', file, fr, pattern, pr)
-          if (fr === fl) {
-            return true
-          }
-        }
-        /* c8 ignore stop */
-        return false
-      }
-
-      // something other than **
-      // non-magic patterns just have to match exactly
-      // patterns with magic have been turned into regexps.
       let hit: boolean
       if (typeof p === 'string') {
         hit = f === p
@@ -930,37 +1027,14 @@ export class Minimatch {
       if (!hit) return false
     }
 
-    // Note: ending in / means that we'll get a final ""
-    // at the end of the pattern.  This can only match a
-    // corresponding "" at the end of the file.
-    // If the file ends in /, then it can only match a
-    // a pattern that ends in /, unless the pattern just
-    // doesn't have any more for it. But, a/b/ should *not*
-    // match "a/b/*", even though "" matches against the
-    // [^/]*? pattern, except in partial mode, where it might
-    // simply not be reached yet.
-    // However, a/b/ should still satisfy a/*
-
-    // now either we fell off the end of the pattern, or we're done.
     if (fi === fl && pi === pl) {
-      // ran out of pattern and filename at the same time.
-      // an exact hit!
       return true
     } else if (fi === fl) {
-      // ran out of file, but still had pattern left.
-      // this is ok if we're doing the match as part of
-      // a glob fs traversal.
       return partial
     } else if (pi === pl) {
-      // ran out of pattern, still have file left.
-      // this is only acceptable if we're on the very last
-      // empty segment of a file with a trailing slash.
-      // a/* should match a/b/
       return fi === fl - 1 && file[fi] === ''
-
       /* c8 ignore start */
     } else {
-      // should be unreachable.
       throw new Error('wtf?')
     }
     /* c8 ignore stop */
